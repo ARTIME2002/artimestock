@@ -217,6 +217,7 @@ async function sync(quiet) {
   if (S.syncing || !S.queue.length || !S.url) return;
   S.syncing = true; softRender();
   const batch = S.queue.slice();
+  let okRun = false;
   try {
     const j = await apiPost({ entries: batch.map(({ id, type, code, qty, date, party, ref, note }) => ({ id, type, code, qty, date, party, ref, note })) });
     if (!j.ok) throw new Error(j.error || 'Sheet error');
@@ -232,10 +233,14 @@ async function sync(quiet) {
     S.queue = S.queue.filter((e) => !done.has(e.id));
     saveQueue();
     applyData(j);
+    okRun = true;
   } catch (e) {
     S.error = errText(e);
     if (!quiet) toast('Saved on this phone. ' + S.error, true);
-  } finally { S.syncing = false; softRender(); }
+  } finally {
+    S.syncing = false; softRender();
+    if (okRun && S.queue.length) setTimeout(() => sync(true), 0);   // entries added while this sync was running
+  }
 }
 
 /* ================= router ================= */
@@ -610,30 +615,29 @@ async function submitForm(type) {
   S.busy = true;
   const f = st.f;
   const e = { id: newId(), ts: Date.now(), type, code: st.row.code, qty: st.q, date: f.date || today(), party: (type === 'in' ? f.party : f.used).trim(), ref: f.ref.trim(), note: f.note.trim() };
-  S.queue.push(e); saveQueue();
+  S.queue.push(e); saveQueue();             // entry has a unique id, so the sheet can never double-count it
   const unit = unitLabel(st.row.unit);
-  const pop = { kind: type, title: 'Added to Stock ' + (type === 'in' ? 'In' : 'Out'), item: st.row.title, qty: (type === 'in' ? '+' : '-') + num(e.qty) + ' ' + unit, status: 'busy', msg: 'Saving to Google Sheets...' };
+  const now = items().find((i) => i.code === e.code);
+  const pop = { kind: type, title: 'Added to Stock ' + (type === 'in' ? 'In' : 'Out'), item: st.row.title, qty: (type === 'in' ? '+' : '-') + num(e.qty) + ' ' + unit, now: now ? 'Stock now ' + num(now.eff) + ' ' + unit : '', status: 'ok', msg: navigator.onLine && S.url ? 'Saving to Google Sheets in background' : 'Saved on this phone. It will sync when you are online.' };
+  if (!navigator.onLine || !S.url) pop.status = 'warn';
   f.qty = 1; f.ref = ''; f.note = '';
   render();
-  const t0 = Date.now();
   showPopup(pop);
-
-  let outcome;
-  if (!navigator.onLine || !S.url) outcome = 'offline';
-  else {
-    await sync(true);
-    outcome = S.failed.some((x) => x.id === e.id) ? 'rejected' : S.queue.some((x) => x.id === e.id) ? 'offline' : 'saved';
-  }
-  const now = items().find((i) => i.code === e.code);
-  pop.now = now ? 'Stock now ' + num(now.eff) + ' ' + unit : '';
-  if (outcome === 'saved') { pop.status = 'ok'; pop.msg = 'Saved to Google Sheets'; }
-  else if (outcome === 'offline') { pop.status = 'warn'; pop.msg = 'Saved on this phone. It will sync when you are online.'; }
-  else { pop.status = 'bad'; pop.kind = 'bad'; pop.title = 'Not added'; pop.msg = 'The sheet rejected it: ' + (S.failed.find((x) => x.id === e.id) || {}).msg; }
-  showPopup(pop);
-  if (outcome === 'rejected') return;      // stays until the person taps OK
-  const wait = Math.max(t0 + 2000 - Date.now(), 1000);   // at least 2 seconds in total
   clearTimeout(popT);
-  popT = setTimeout(closePopup, wait);
+  popT = setTimeout(closePopup, 1200);      // popup is instant; the sheet saves in the background
+  flushEntry(e.id, pop);
+}
+// send to the sheet without blocking the screen; only interrupt if the sheet rejects the entry
+async function flushEntry(id, pop) {
+  if (!navigator.onLine || !S.url) return;
+  while (S.syncing) await new Promise((r) => setTimeout(r, 200));
+  if (S.queue.some((x) => x.id === id)) await sync(true);
+  const bad = S.failed.find((x) => x.id === id);
+  if (bad) {
+    clearTimeout(popT);
+    showPopup(Object.assign({}, pop, { kind: 'bad', status: 'bad', title: 'Not added', now: '', msg: 'The sheet rejected it: ' + bad.msg }));
+    S.busy = true;                          // stays until the person taps OK
+  }
 }
 
 /* ---------- confirmation popup ---------- */
@@ -802,26 +806,14 @@ async function submitDial() {
   const f = st.f;
   const e = { id: newId(), ts: Date.now(), type: 'out', code: st.row.code, qty: st.q, date: f.date || today(), party: (f.used || '').trim() || 'Production', ref: (f.ref || '').trim(), note: (f.note || '').trim() };
   S.queue.push(e); saveQueue();
-  const pop = { kind: 'out', title: 'Dial Out recorded', item: st.row.title, qty: '-' + num(e.qty) + ' dial' + (e.qty === 1 ? '' : 's'), status: 'busy', msg: 'Saving to Google Sheets...' };
+  const online = navigator.onLine && S.url;
+  const pop = { kind: 'out', title: 'Dial Out recorded', item: st.row.title, qty: '-' + num(e.qty) + ' dial' + (e.qty === 1 ? '' : 's'), now: 'All parts for this size were taken out', status: online ? 'ok' : 'warn', msg: online ? 'Saving to Google Sheets in background' : 'Saved on this phone. It will sync when you are online.' };
   f.qty = 1; f.ref = ''; f.note = '';
   render();
-  const t0 = Date.now();
   showPopup(pop);
-  let outcome;
-  if (!navigator.onLine || !S.url) outcome = 'offline';
-  else {
-    await sync(true);
-    outcome = S.failed.some((x) => x.id === e.id) ? 'rejected' : S.queue.some((x) => x.id === e.id) ? 'offline' : 'saved';
-  }
-  pop.now = 'All parts for this size were taken out';
-  if (outcome === 'saved') { pop.status = 'ok'; pop.msg = 'Saved to Google Sheets'; }
-  else if (outcome === 'offline') { pop.status = 'warn'; pop.msg = 'Saved on this phone. It will sync when you are online.'; }
-  else { pop.status = 'bad'; pop.kind = 'bad'; pop.title = 'Not added'; pop.now = ''; pop.msg = 'The sheet rejected it: ' + (S.failed.find((x) => x.id === e.id) || {}).msg; }
-  showPopup(pop);
-  if (outcome === 'rejected') return;
-  const wait = Math.max(t0 + 2000 - Date.now(), 1000);
   clearTimeout(popT);
-  popT = setTimeout(closePopup, wait);
+  popT = setTimeout(closePopup, 1200);
+  flushEntry(e.id, pop);
 }
 
 /* ================= boot ================= */
@@ -832,4 +824,3 @@ onRoute();
 lastVis = Date.now();
 if (S.queue.length) sync(true); else refresh(true);
 })();
-
