@@ -14,6 +14,12 @@ function dialParts(code) {
   const sz = String(code).slice(4); const s = (sz === '12' || sz === '18') ? '12-18' : sz;
   return ['HND-' + s, 'PVR-' + s, 'PVP-' + s, 'GLS-' + s, 'IRR-' + s, 'MCH-ALL', 'IRP-' + s, sz === '06' ? 'TIK-06' : 'TIK-08-18'];
 }
+const DIAL_PART_NAMES = ['Clock Hands', 'PVC Ring', 'PVC Paper', 'Glass', 'Iron Ring', 'Machine', 'Iron Plate', 'Tikkla'];
+// A dial out with some parts left out carries a tag like [-TIK-08-18] in its note.
+// The Google Sheet ("Dial Recipe" tab) reads that tag and does not deduct that part.
+const skipTok = (c) => '[-' + c + ']';
+const skippedOf = (note) => { const out = []; String(note || '').replace(/\[-([A-Z0-9-]+)\]/g, (m, c) => { out.push(c); return m; }); return out; };
+const cleanNote = (note) => String(note || '').replace(/\s*\[-[A-Z0-9-]+\]/g, '').trim();
 const CAT_NAME = { clock: 'Clock Items', packing: 'Packaging Items' };
 
 /* ================= helpers ================= */
@@ -140,7 +146,7 @@ function items() {
   const pend = {};
   S.queue.forEach((e) => {
     pend[e.code] = (pend[e.code] || 0) + (e.type === 'in' ? 1 : -1) * Number(e.qty);
-    if (e.type === 'out' && isDial(e.code)) dialParts(e.code).forEach((c) => { pend[c] = (pend[c] || 0) - Number(e.qty); });
+    if (e.type === 'out' && isDial(e.code)) { const sk = skippedOf(e.note); dialParts(e.code).filter((c) => !sk.includes(c)).forEach((c) => { pend[c] = (pend[c] || 0) - Number(e.qty); }); }
   });
   return S.items.map((r) => {
     const p = parseName(r.item);
@@ -257,6 +263,7 @@ function onRoute() {
   if (isFormRoute(r.name)) {
     const f = ensureForm(r.name);
     f.date = today();
+    if (r.name === 'dial') f.skip = [];     // every part ticked each time, so nothing is left out by mistake
     const code = r.q.get('code');
     if (code && r.name === 'dial') f.dcode = code;
     else if (code) f.wantCode = code;
@@ -301,7 +308,7 @@ function softRender() {
 function topHome() {
   const alerts = items().filter((i) => i.st === 'out' || i.st === 'low').length;
   return `<header class="top">
-    <a class="ibtn" href="#/more" aria-label="Menu">${ic('menu', 26)}</a>
+    <button class="ibtn" data-act="menu" aria-label="Menu">${ic('menu', 26)}</button>
     <div class="grow"><h1>${esc(APP_NAME)}</h1><div class="sub">${esc(TAGLINE)}</div></div>
     <a class="ibtn" href="#/items?focus=1" aria-label="Search">${ic('search', 26)}</a>
     <a class="ibtn" href="#/items?status=alert" aria-label="Low stock alerts">${ic('bell', 26)}${alerts ? '<span class="dot"></span>' : ''}</a>
@@ -396,8 +403,10 @@ function itemRow(i) {
 }
 function actRow(e, nm) {
   const inn = e.type === 'in';
+  const dl = !inn && isDial(e.code);
+  const left = dl ? skippedOf(e.note).map((c) => String(nm[c] || c).split(' - ')[0]) : [];
   return `<div class="act"><span class="aic ${inn ? 'in' : 'out'}">${ic(inn ? 'up' : 'down', 22, 2.2)}</span>
-    <div class="am"><b>Stock ${inn ? 'In' : 'Out'}</b><span>${esc(nm[e.code] || e.code)}</span></div>
+    <div class="am"><b>${dl ? 'Dial Out' : 'Stock ' + (inn ? 'In' : 'Out')}</b><span>${esc(nm[e.code] || e.code)}${left.length ? ' - without ' + esc(left.join(', ')) : ''}</span></div>
     <div class="ar"><b class="${inn ? 'g' : 'r'}">${inn ? '+' : '-'}${num(e.qty)}</b><span class="${e.pending ? 'pend' : ''}">${e.pending ? 'Waiting to sync' : esc(when(e))}</span></div></div>`;
 }
 
@@ -528,7 +537,7 @@ function vMore() {
 
 /* ---------- Stock In / Out form ---------- */
 function ensureForm(type) {
-  if (!S.form[type]) S.form[type] = { t: type, cat: 'packing', base: null, variant: null, size: null, qty: 1, date: today(), party: '', ref: '', note: '', used: '' };
+  if (!S.form[type]) S.form[type] = { t: type, cat: 'packing', base: null, variant: null, size: null, qty: 1, date: today(), party: '', ref: '', note: '', used: '', skip: [] };
   return S.form[type];
 }
 function resolve(f) {
@@ -657,6 +666,23 @@ function closePopup() { clearTimeout(popT); $('#popup').innerHTML = ''; S.busy =
 function renderSheet() {
   const el = $('#sheet'); const s = S.sheet;
   if (!s) { el.innerHTML = ''; return; }
+  if (s.type === 'menu') {
+    const link = (href, icon, title, sub) => `<a class="mi" href="${href}">${ic(icon, 24)}<span><b>${title}</b><small>${sub}</small></span>${ic('right', 18)}</a>`;
+    const al = items().filter((i) => i.st === 'out' || i.st === 'low').length;
+    el.innerHTML = `<div class="scrim side" data-act="close"><aside class="drawer" role="dialog" aria-label="Menu">
+      <div class="dh"><b>${esc(APP_NAME)}</b><small>${esc(TAGLINE)}</small></div>
+      <div class="dsec">Quick actions</div>
+      ${link('#/dial', 'gear', 'Dial Out', 'Make dials, choose the parts')}
+      ${link('#/in', 'up', 'Stock In', 'Add incoming stock')}
+      ${link('#/out', 'down', 'Stock Out', 'Record outgoing stock')}
+      <div class="dsec">Browse</div>
+      ${link('#/items', 'cube', 'All Items', 'Search and filter')}
+      ${link('#/items?status=alert', 'bell', 'Low Stock Alerts', al ? al + ' need attention' : 'Nothing running low')}
+      ${link('#/categories', 'grid', 'Categories', 'Packaging and clock items')}
+      ${link('#/reports', 'chart', 'Reports', 'Stock movement over time')}
+    </aside></div>`;
+    return;
+  }
   if (s.type === 'add') {
     el.innerHTML = `<div class="scrim" data-act="close"><div class="sheet" role="dialog" aria-label="New entry"><div class="grab"></div><h3>New entry</h3><div class="acts">
       <a class="bigact in" href="#/in">${ic('up', 34, 2.2)}<span><b>Stock In</b><small>Add incoming stock</small></span></a>
@@ -691,6 +717,7 @@ document.addEventListener('click', (ev) => {
     case 'sync': S.queue.length ? sync() : refresh(); break;
     case 'refresh': refresh(); break;
     case 'add': S.sheet = { type: 'add' }; renderSheet(); break;
+    case 'menu': S.sheet = { type: 'menu' }; renderSheet(); break;
     case 'close': if (ev.target === el) { S.sheet = null; renderSheet(); } break;
     case 'open-item': S.sheet = { type: 'item', code: el.dataset.code }; renderSheet(); break;
     case 'go-more': location.hash = '#/more'; break;
@@ -699,6 +726,8 @@ document.addEventListener('click', (ev) => {
     case 'rrange': S.repRange = Number(v); render(); break;
     case 'fcat': ensureForm(type).cat = v; render(); break;
     case 'fsize': ensureForm(type).size = v; render(); break;
+    case 'dpart': { const f = ensureForm('dial'); const i = Number(v); f.skip = f.skip.includes(i) ? f.skip.filter((x) => x !== i) : f.skip.concat(i); updateDial(); break; }
+    case 'dall': { const f = ensureForm('dial'); f.skip = f.skip.length ? [] : DIAL_PART_NAMES.map((_, i) => i); updateDial(); break; }
     case 'dsize': ensureForm('dial').dcode = v; render(); break;
     case 'fvar': ensureForm(type).variant = v; render(); break;
     case 'qplus': case 'qminus': {
@@ -757,11 +786,14 @@ function dialState() {
   const row = ds.find((d) => d.code === f.dcode) || null;
   const q = Number(f.qty);
   const byCode = {}; items().forEach((i) => { byCode[i.code] = i; });
-  const parts = row ? dialParts(row.code).map((c) => byCode[c]).filter(Boolean) : [];
-  const short = parts.filter((p) => p.eff < q);
+  const parts = row ? dialParts(row.code).map((c, i) => ({ i, code: c, name: DIAL_PART_NAMES[i], it: byCode[c], on: !f.skip.includes(i) })).filter((p) => p.it) : [];
+  const chosen = parts.filter((p) => p.on);
+  const short = chosen.filter((p) => p.it.eff < q);
+  const limit = chosen.length ? chosen.reduce((a, p) => (p.it.eff < a.it.eff ? p : a)) : null;
+  const canMake = limit ? Math.max(0, Math.floor(limit.it.eff)) : 0;
   let err = '';
-  if (!row) err = 'Choose a dial size.'; else if (!(q > 0)) err = 'Enter a quantity above 0.';
-  return { f, ds, row, q, parts, short, err, ok: !err };
+  if (!row) err = 'Choose a dial size.'; else if (!(q > 0)) err = 'Enter a quantity above 0.'; else if (!chosen.length) err = 'Tick at least one part.';
+  return { f, ds, row, q, parts, chosen, short, limit, canMake, err, ok: !err };
 }
 function vDial() {
   const st = dialState(); const f = st.f;
@@ -789,12 +821,13 @@ function updateDial() {
   const q = st.q > 0 ? st.q : 0;
   if (st.row) {
     card.innerHTML = `<div class="pcard"><div class="head">${art('Dial', 76)}<div><b>${esc(st.row.code)}</b><small>${esc(st.row.title)}</small></div></div>
-      <div class="parts-h">These parts go out for ${num(q)} dial${q === 1 ? '' : 's'} </div>
-      ${st.parts.map((p) => `<div class="part"><span>${esc(p.title)}</span><span>${num(p.eff)} &rarr; <b class="${p.eff - q < 0 ? 'r' : ''}">${num(p.eff - q)}</b></span></div>`).join('')}</div>`;
+      <div class="parts-h"><span>Tick the parts that go out for ${num(q)} dial${q === 1 ? '' : 's'}</span><button class="selall" data-act="dall">${st.parts.some((p) => !p.on) ? 'Select all' : 'Clear all'}</button></div>
+      ${st.parts.map((p) => `<button class="part pick ${p.on ? 'on' : 'off'}" data-act="dpart" data-v="${p.i}" role="checkbox" aria-checked="${p.on}"><span class="cb">${p.on ? ic('check', 16, 3) : ''}</span><span class="pn">${esc(p.it.title)}</span>${p.on ? `<span class="pv">${num(p.it.eff)} &rarr; <b class="${p.it.eff - q < 0 ? 'r' : ''}">${num(p.it.eff - q)}</b></span>` : '<span class="pv skip">Not used</span>'}</button>`).join('')}</div>`;
   } else card.innerHTML = '';
   const hint = $('#qhint');
   if (hint) {
-    if (st.row && st.short.length && q > 0) { hint.textContent = 'Not enough ' + st.short.map((p) => p.title).join(', ') + '. Stock will go below zero.'; hint.className = 'hint bad'; }
+    if (st.row && st.short.length && q > 0) { hint.textContent = 'Not enough ' + st.short.map((p) => p.it.title).join(', ') + '. Stock will go below zero.'; hint.className = 'hint bad'; }
+    else if (st.row && st.limit) { hint.textContent = `Stock allows up to ${num(st.canMake)} dial${st.canMake === 1 ? '' : 's'} (limited by ${st.limit.name}).`; hint.className = 'hint'; }
     else { hint.textContent = ''; hint.className = 'hint'; }
   }
   const btn = $('#fsubmit'); if (btn) btn.disabled = !st.ok;
@@ -804,11 +837,13 @@ async function submitDial() {
   const st = dialState(); if (!st.ok) return;
   S.busy = true;
   const f = st.f;
-  const e = { id: newId(), ts: Date.now(), type: 'out', code: st.row.code, qty: st.q, date: f.date || today(), party: (f.used || '').trim() || 'Production', ref: (f.ref || '').trim(), note: (f.note || '').trim() };
+  const left = st.parts.filter((p) => !p.on);
+  const note = [(f.note || '').trim()].concat(left.map((p) => skipTok(p.code))).filter(Boolean).join(' ');
+  const e = { id: newId(), ts: Date.now(), type: 'out', code: st.row.code, qty: st.q, date: f.date || today(), party: (f.used || '').trim() || 'Production', ref: (f.ref || '').trim(), note };
   S.queue.push(e); saveQueue();
   const online = navigator.onLine && S.url;
-  const pop = { kind: 'out', title: 'Dial Out recorded', item: st.row.title, qty: '-' + num(e.qty) + ' dial' + (e.qty === 1 ? '' : 's'), now: 'All parts for this size were taken out', status: online ? 'ok' : 'warn', msg: online ? 'Saving to Google Sheets in background' : 'Saved on this phone. It will sync when you are online.' };
-  f.qty = 1; f.ref = ''; f.note = '';
+  const pop = { kind: 'out', title: 'Dial Out recorded', item: st.row.title, qty: '-' + num(e.qty) + ' dial' + (e.qty === 1 ? '' : 's'), now: left.length ? 'Without ' + left.map((p) => p.name).join(', ') : 'All parts for this size were taken out', status: online ? 'ok' : 'warn', msg: online ? 'Saving to Google Sheets in background' : 'Saved on this phone. It will sync when you are online.' };
+  f.qty = 1; f.ref = ''; f.note = ''; f.skip = [];
   render();
   showPopup(pop);
   clearTimeout(popT);
